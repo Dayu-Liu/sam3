@@ -1,0 +1,177 @@
+box_demo_main.py 变量名注释一览
+========================================
+
+【命令行参数 (args)】
+
+args.prompt           — SAM3 模型的提示词，默认 "box"，告诉模型要检测的物体类别
+args.host             — SAM3 预测服务端的 IP 地址，默认 192.168.112.198
+args.port             — SAM3 预测服务端的端口号，默认 5300
+args.iface            — DDS 通信使用的网络接口名（如 eth0），用于 ChannelFactoryInitialize
+args.no_confirm       — 是否跳过执行前的用户确认提示（--no-confirm 时为 True）
+args.end_behavior     — 抓取结束后控制权释放方式：
+                        "handoff_rl_lower" = 先对齐 RL_LOWER 姿态再释放
+                        "release" = 直接释放
+args.vlm_endpoint     — VLM (视觉语言模型) API 地址，默认阿里千问 DashScope 兼容接口
+args.vlm_api_key      — VLM API 密钥，默认从环境变量 QWEN_API_KEY 读取
+args.vlm_model        — VLM 模型名称，默认 qwen-vl-max
+args.vlm_max_iter     — VLM 引导 + 抓取尝试的最大循环次数（也即 max_attempts）
+args.vlm_velocity     — 机器人行走速度 (m/s)，默认 0.7，匹配键盘 w 的速度
+args.walk_scale       — 行走距离补偿系数，>1 时走更远以补偿 RL 策略的欠追踪问题
+args.vlm_min_move     — 最小移动时长 (ms)，低于此值跳过移动指令
+
+
+【全局常量】
+
+GOAL_CSV_PATH         — 目标关节数据 CSV 文件的保存路径 (goal.csv)，与脚本同目录
+_T_TRANS              — 相机 (D435) 相对于 torso_link 的平移向量 [x, y, z]（米），来自 URDF
+_PITCH                — 相机安装俯仰角 (rad)，约 47.6°，来自 URDF d435_joint 的 rpy
+_cp, _sp              — _PITCH 的余弦值和正弦值，用于构造旋转矩阵
+_R_TORSO_BODY         — 从相机 body 坐标系到 torso_link 坐标系的旋转矩阵（纯 Y 轴旋转）
+_R_BODY_OPTICAL       — 从相机光学坐标系到相机 body 坐标系的固定旋转矩阵（坐标轴重映射）
+_R_TORSO_OPT          — 从光学坐标系直接到 torso_link 的总旋转矩阵（以上两个矩阵的乘积）
+
+
+【WaistRotator 类属性】
+
+KP_WAIST              — 腰部关节 PD 控制的比例增益 (20.0)
+KD_WAIST              — 腰部关节 PD 控制的微分增益 (1.5)
+KP_ARM                — 手臂关节 PD 控制的比例增益 (40.0)，用于保持手臂位置不变
+KD_ARM                — 手臂关节 PD 控制的微分增益 (2.0)
+ROTATE_DURATION       — 腰部旋转指令持续时间 (3.5s)，余弦插值总时长
+ROTATE_INTERVAL       — 旋转过程中帧间隔 (0.05s)，即发布频率的倒数
+KEEPALIVE_INTERVAL    — 保持位置的后台 keepalive 帧间隔 (0.05s)，20Hz
+SETTLE_TOLERANCE      — 腰部收敛判断容差 (0.02 rad ≈ 1.1°)
+SETTLE_TIMEOUT        — 等待腰部收敛的超时时间 (1.0s)
+self._pub             — DDS 发布器，发布到 "rt/arm_sdk" 话题
+self._sub             — DDS 订阅器，订阅 "rt/lowstate" 话题
+self._low_state       — 最新的机器人低层状态快照 (LowState_)
+self._arm_q           — 初始化时捕获的手臂关节位置列表（索引12-28共17个），用于 hold 住手臂
+self._ready           — 线程事件，DDS 订阅首次收到数据后 set
+self.yaw              — 累积的腰部偏航角 (rad)，正值=左转
+self._hold            — keepalive 线程运行标志
+self._hold_target     — keepalive 保持的目标腰部角度
+self._thread          — 后台 keepalive 线程对象
+
+
+【主流程局部变量】
+
+waist                 — WaistRotator 实例，控制上半身旋转
+mover                 — RobotMover 实例，控制机器人行走（前进/后退/侧移/旋转）
+vlm                   — VLMGuide 实例，视觉语言模型引导（检测箱子、判断裁切状态）
+camera                — CameraSession 实例（上下文管理器），管理相机的采集、预热、启停
+img_dir               — 采集图像的保存目录路径 (./img/)
+max_attempts          — 抓取循环最大尝试次数，等于 args.vlm_max_iter
+
+
+【移动衰减参数】
+
+_MOVE_DECAY_FACTOR    — 移动距离衰减因子 0.6，IK 失败时每轮乘以此值减小移动量
+_MOVE_DECAY_FLOOR     — 衰减下限 0.6，防止衰减过小导致无法有效接近目标
+_MOVE_MAX_X           — 前后方向单次最大移动距离 (米)，限制 0.50m
+_MOVE_MAX_Y           — 左右方向单次最大移动距离 (米)，限制 0.30m
+_move_decay           — 当前衰减系数，初始 1.0，IK 持续失败时逐轮递减
+_prev_ik_err          — 上一次 IK 检查的误差值，用于判断误差是否在缩小
+_yaw_aligned          — 标记是否已做过侧移对齐（True 后不再重复侧移）
+
+
+【快速 IK 参数】
+
+_ik_fast              — ArmKinematics 实例，用于快速 IK 预检（不做完整求解）
+IK_ERR_LIMIT          — 快速 IK 允许的最大位置误差 (米)，0.040 = 40mm
+IK_FAST_RESTARTS      — 快速 IK 的多起点重启次数，3
+IK_FAST_MAX_ITER      — 快速 IK 单次求解最大迭代次数，250
+IDEAL_REACH_X         — 理想的抓取前向距离 (torso 系 X)，0.40m，手臂半伸展时重心稳定
+
+
+【外层 while True 循环（搜索+抓取）】
+
+color                 — 相机采集的彩色图像 (BGR ndarray)
+depth                 — 相机采集的深度图 (mm ndarray)
+vlm_result            — VLM 返回的字典，包含：
+                        box_visible = 是否看到箱子 (bool)
+                        box_in_frame = 裁切状态 (str)
+box_frame             — 箱子在画面中的裁切状态：
+                        "left_cut"  = 左侧被裁切
+                        "right_cut" = 右侧被裁切
+                        "both_cut"  = 两侧都被裁切（太近）
+                        "complete"  = 完整显示
+sam3_check            — SAM3 模型预测结果（非 None 表示找到了箱子的两个面）
+center_depth          — 深度图中心区域的中位深度值 (米)，用于判断太近还是太远
+NEAR_THRESHOLD        — 判断"太近"的深度阈值 (米)，0.45 = 45cm
+found_angle           — 发现箱子时腰部累计偏航角 (rad)
+
+
+【内层 for attempt 循环（抓取尝试）】
+
+attempt               — 当前抓取尝试编号 (1 ~ max_attempts)
+result                — SAM3 预测返回的字典，包含：
+                        grasp_left  = 左手抓取点在相机系下的坐标 [x,y,z]
+                        grasp_right = 右手抓取点在相机系下的坐标 [x,y,z]
+                        center      = 箱子中心在相机系下的坐标 [x,y,z]
+                        extent      = 箱子尺寸 [dx,dy,dz]（米）
+left_torso            — 左手抓取点在 torso_link 坐标系下的坐标 (ndarray, 3)，经过手长补偿
+right_torso           — 右手抓取点在 torso_link 坐标系下的坐标 (ndarray, 3)，经过手长补偿
+box_center_cam        — 箱子中心在相机光学坐标系下的坐标 (ndarray)
+box_center_torso      — 箱子中心在 torso_link 坐标系下的坐标 (ndarray)
+extent                — SAM3 返回的箱子尺寸 [dx, dy, dz]（米），三个方向的跨度
+min_extent            — 箱子最小维度 (米)，用于判断箱子是否被严重裁切（视角问题）
+max_extent            — 箱子最大维度 (米)，配合 min_extent 判断"太近"
+box_x                 — 箱子中心的 torso 系 X 坐标（前方距离），用于判断站太近
+step_back             — 太近时后退的距离 (米)
+need_center           — 是否需要侧移对齐（横向偏移 > 15cm）
+lateral               — 箱子中心的 torso 系 Y 坐标（横向偏移量，正=左）
+step                  — 实际侧移步长 = lateral × 1.2，多移 20% 补偿 RL 欠追踪
+MAX_REACH_X           — 抓取点前向距离上限 (米)，0.45m，超过则先走近
+avg_reach_x           — 左右手抓取点 X 坐标的平均值（平均前向距离）
+move_forward          — 需要前移的距离 = (avg_reach_x - IDEAL_REACH_X) × 0.7
+left_ok / right_ok    — 左/右手快速 IK 是否在工作空间内
+left_err / right_err  — 左/右手快速 IK 的位置误差 (米)
+left_q_fast / right_q_fast — 左/右手快速 IK 求得的关节角，作为后续完整 IK 的初始值
+move_x, move_y        — 几何估算出的机器人需要移动的前后/左右距离 (米)
+cur_err               — 当前 IK 最大误差（取左右手中较大者）
+safe_x, safe_y        — 经过衰减和上下限裁剪后的实际移动距离
+controller            — DualArmController 实例，负责完整 IK 求解和双臂运动执行
+ik_start              — IK 求解的起始时间戳
+ik_elapsed            — IK 求解耗时 (秒)
+csv_need_header       — 是否需要写入 CSV 表头（文件不存在时为 [True]）
+
+
+【Step 3 坐标转换中的手长补偿】
+
+  left_torso[0]  -= 0.16   X方向退 16cm，补偿手腕到指尖的长度
+  left_torso[1]  += 0.05   Y方向偏 +5cm，让双手间距略大于箱子（夹紧余量）
+  left_torso[2]  += 0.09   Z方向上抬 9cm，补偿指尖到掌心的垂直距离
+  (right_torso 同理)
+
+
+【_walk 内部变量】
+
+dist_x                — 前后方向移动距离 (米)，正=前进，负=后退
+dist_y                — 左右方向移动距离 (米)，正=左移，负=右移
+scaled                — 经过 walk_scale 补偿后的实际前进距离
+moved                 — 是否执行了任何移动（用于判断是否需要等待稳定）
+
+
+【save_goal_to_csv 参数】
+
+left_torso / right_torso — 左/右手目标点在 torso 系下的坐标
+target_q              — IK 求得的 17 个目标关节角（左臂7 + 右臂7 + 腰3）
+left_fk / right_fk    — 正运动学验算的左/右手末端位置（与目标做对比验证）
+need_header           — 列表包裹的布尔值 [bool]，首次写入时为 [True]，写入后变为 [False]
+
+
+【_compute_move_distance 参数】
+
+target_left / target_right — 左/右手目标点的 torso 坐标（用于估算前移距离）
+box_center_y          — 箱子中心的 Y 坐标（用于估算侧移距离）
+move_x                — 估算的前移距离 = 左手X - IDEAL_REACH_X
+move_y                — 估算的侧移距离 = box_center_y
+
+
+【_check_workspace_ik / _ik_error_at 参数】
+
+name                  — 手的名称 ("左" 或 "右")，仅用于打印
+target                — 目标点坐标 (ndarray, 3,)
+left                  — 是否为左手（影响 IK 求解的镜像处理）
+q                     — IK 求得的关节角
+err                   — IK 末端位置误差 (米)

@@ -1,0 +1,73 @@
+# ─────────────────────────────────────────────────────────────
+# box_demo_2 .gitignore
+# ─────────────────────────────────────────────────────────────
+
+# ── 密钥 / 凭证(防止误推 API Key) ─────────────────────────────
+# 任何带 key/secret/cred/token 的文件都不应进 git
+*.env
+.env
+.env.*
+*.secret
+*.secrets
+secrets.*
+*api_key*
+*apikey*
+*credentials*
+*.token
+# 千问 / 阿里云 / OpenAI key 专用占位
+qwen_api_key*.txt
+openai_api_key*.txt
+dashscope_api_key*.txt
+
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+develop-eggs/
+*.whl
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ── 虚拟环境 ──────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── IDE / 编辑器 ──────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ── 运行时产物 / 日志 ─────────────────────────────────────────
+*.log
+logs/
+state.csv
+goal.csv
+*.tmp
+*.bak
+
+# ── 大体积模型 / 数据(box_demo_2 实际运行产物) ───────────────
+img/
+*.onnx
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.zip
+
+# ── RoboJuDo / unitree_cpp 编译产物(若拷进项目) ─────────────
+build/
+*.cpython-*.so

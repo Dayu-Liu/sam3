@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""RemoteMover — drive the GR00T-WBC base over HTTP from a different machine.
+
+Same interface as GrootMover (drop-in for box_demo's mover), but instead of
+writing the local IPC file /tmp/robojudo_ext_cmd.json it talks to the HTTP IPC
+bridge (agile_http_ipc_server.py --backend legacy-ipc) running on the machine
+that hosts the GR00T adapter (the 5080).
+
+This is the Option-1 topology: box_demo runs ON THE ROBOT (head RealSense
+USB-direct, frames POSTed to the SAM3 server on the 5080), while the GR00T base
+(adapter + merger, GPU) stays on the 5080. box_demo's locomotion commands are
+relayed to that base over HTTP.
+
+It REUSES GrootMover's cm/deg -> velocity + floor + min-duration logic verbatim
+(so the Balance/Walk 0.05 threshold handling is identical); only the emit changes
+from a local file write to an HTTP GET. The hold-for-`duration` refresh runs on
+the SERVER side (the /cmd?duration endpoint spawns a refresh thread next to the
+adapter), so there is no per-tick network spam — we fire one request and block
+locally for the move to finish.
+
+Endpoints (agile_http_ipc_server.py):
+  /cmd?vx&vy&wz&duration&height&fsm   hold a velocity for `duration` then zero
+  /mode?fsm=...                       set FSM (RL_FULL / RL_LOWER / LIMP)
+  /height?height=                     set absolute base height
+  /stop                               zero velocity, hold balance
+  /damp                               DAMP (kd-only e-stop)
+"""
+
+from __future__ import annotations
+
+import time
+
+import requests
+
+from groot_mover import MAX_HEIGHT, MIN_HEIGHT, GrootMover, _clamp
+
+
+class RemoteMover(GrootMover):
+    """HTTP-IPC mover: box_demo (robot) -> agile_http_ipc_server (5080) -> adapter."""
+
+    def __init__(self, ipc_url: str, *, timeout: float = 2.0, **kwargs):
+        super().__init__(**kwargs)
+        self.ipc_url = ipc_url.rstrip("/")
+        self._timeout = timeout
+        self._session = requests.Session()
+        self._session.trust_env = False  # never route localhost/LAN via a proxy
+
+    # ----------------------------------------------------------------- transport
+    def _get(self, path: str, **params) -> None:
+        try:
+            r = self._session.get(f"{self.ipc_url}{path}", params=params,
+                                  timeout=self._timeout)
+            if r.status_code != 200:
+                self._log(f"HTTP {path} -> {r.status_code}: {r.text[:120]}")
+        except Exception as exc:  # network hiccup must not crash the grasp loop
+            self._log(f"HTTP {path} failed: {exc}")
+
+    # --------- override the low-level primitives: the server holds each phase
+    def _hold(self, forward: float, lateral: float, yaw: float,
+              duration: float) -> None:
+        """One /cmd?duration -> the server's motion thread holds this velocity
+        for `duration` then zeroes; we block locally for the hold. Chained holds
+        (settle-before -> warm-up -> move) each cancel the previous server thread,
+        so _execute_move composes over HTTP exactly like the local IPC path."""
+        if duration <= 0:
+            return
+        self._get("/cmd", vx=forward, vy=lateral, wz=yaw, duration=duration,
+                  height=self._height, fsm="RL_FULL")
+        time.sleep(duration)
+
+    def _settle(self) -> None:
+        self._get("/stop", height=self._height)
+        time.sleep(self.stop_hold_s)
+
+    def _refresh_for(self, forward: float, lateral: float, yaw: float,
+                     duration: float) -> None:  # back-compat
+        self._hold(forward, lateral, yaw, duration)
+        self._settle()
+
+    # --------------------------------------------------- state transitions
+    def initialize(self) -> None:
+        self._get("/mode", fsm="RL_FULL", height=self._height)
+        time.sleep(1.5)
+        self._log(f"RL_FULL ready (remote {self.ipc_url}).")
+
+    def stop(self) -> None:
+        self._get("/stop", height=self._height)
+
+    def set_height(self, height: float) -> None:
+        self._height = float(_clamp(height, MIN_HEIGHT, MAX_HEIGHT))
+        self._get("/height", height=self._height)
+        self._log(f"base height = {self._height:.2f}m")
+
+    def shutdown(self) -> None:
+        self._get("/mode", fsm="RL_LOWER", height=self._height)
+        time.sleep(0.5)
+        self._log("RL_LOWER (legs balance, arms free).")
+
+    handoff_to_arms = shutdown  # re-bind to RemoteMover.shutdown
+
+    def damp(self) -> None:
+        self._get("/damp", height=self._height)
+        self._log("DAMP (kd-only damping).")
+
+    estop = damp
+
+    def limp(self) -> None:
+        self._get("/mode", fsm="LIMP", height=self._height)
+        self._log("LIMP (release stiffness).")
+
+    def release(self) -> None:
+        self._get("/stop", height=self._height)
+        self._log("stopped (remote; IPC file owned by the 5080).")
