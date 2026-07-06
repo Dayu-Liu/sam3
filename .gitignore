@@ -170,3 +170,8 @@ assets/images/*_analysis*.png
 assets/images/*_missing*.png
 assets/images/*_plain*.png
 assets/images/*_bar*.png
+
+# Keep only smoke-test images in git; ignore other local demo assets
+assets/images/*
+!assets/images/13.jpg
+!assets/images/13_d.png
