@@ -76,7 +76,6 @@ STD_RATIO    = 2.0
 # mask 内缩（剔除边缘不可靠深度）
 MASK_ERODE_PX        = 5    # 内缩像素数；边缘带不参与反投影
 MASK_CORE_MIN_PIXELS = 80   # 内缩后 mask 最少像素，不足则逐步减小内缩
-MASK_BORDER_MARGIN_PX = 3   # 距图像边界≤N像素内有 mask 像素即视为触边
 
 # DBSCAN 聚类参数（用于过滤聚集的噪声片）
 DBSCAN_EPS        = 0.05   # 邻域半径（米），点间距小于此值视为同一簇
@@ -385,32 +384,14 @@ def get_mask(processor: Sam3Processor, rgb_image: Image.Image, prompt: str):
     return mask.astype(bool)
 
 
-def align_mask_to_shape(mask: np.ndarray, height: int, width: int) -> np.ndarray:
-    """将 mask 对齐到 RGB 图像尺寸（与 make_mask_overlay 一致）。"""
-    mask_bool = mask.astype(bool)
-    if mask_bool.shape == (height, width):
-        return mask_bool
-    mask_pil = Image.fromarray(mask_bool.astype(np.uint8) * 255)
-    return np.array(mask_pil.resize((width, height), Image.NEAREST)) > 127
-
-
-def mask_border_touches(
-    mask: np.ndarray,
-    margin_px: int = MASK_BORDER_MARGIN_PX,
-) -> dict[str, bool]:
-    """检测分割 mask 是否触及图像四边（带容差）。
-
-    margin_px=0：最外圈行/列有 mask 像素才算触边。
-    margin_px=N：距边界 ≤ N 像素内有 mask 像素也算触边。
-    """
-    mask_bool = mask.astype(bool)
-    h, w = mask_bool.shape[:2]
-    m = max(0, int(margin_px))
+def mask_border_touches(mask: np.ndarray) -> dict[str, bool]:
+    """检测分割 mask 是否触及图像四边。"""
+    h, w = mask.shape[:2]
     return {
-        "top": bool(np.any(mask_bool[0 : m + 1, :])),
-        "bottom": bool(np.any(mask_bool[h - 1 - m : h, :])),
-        "left": bool(np.any(mask_bool[:, 0 : m + 1])),
-        "right": bool(np.any(mask_bool[:, w - 1 - m : w])),
+        "top": bool(np.any(mask[0, :])),
+        "bottom": bool(np.any(mask[h - 1, :])),
+        "left": bool(np.any(mask[:, 0])),
+        "right": bool(np.any(mask[:, w - 1])),
     }
 
 
@@ -1174,9 +1155,8 @@ async def predict(
         logger.info(f"收到请求: prompt='{prompt}', rgb={rgb_image.size}, depth={depth_image.size}")
 
         mask = get_mask(_processor, rgb_image, prompt)
-        rgb_np = np.array(rgb_image.convert("RGB"))
-        mask = align_mask_to_shape(mask, rgb_np.shape[0], rgb_np.shape[1])
         mask_touches = mask_border_touches(mask)
+        rgb_np = np.array(rgb_image.convert("RGB"))
         mask_core, mask_edge, mask_erode_px = build_mask_core(mask)
         logger.info(
             f"mask 内缩: erode={mask_erode_px}px，核心 {int(mask_core.sum())} px，"
@@ -1350,9 +1330,8 @@ async def perceive_object(
         )
 
         mask = get_mask(_processor, rgb_image, prompt)
-        rgb_np = np.array(rgb_image.convert("RGB"))
-        mask = align_mask_to_shape(mask, rgb_np.shape[0], rgb_np.shape[1])
         mask_touches = mask_border_touches(mask)
+        rgb_np = np.array(rgb_image.convert("RGB"))
         mask_core, mask_edge, mask_erode_px = build_mask_core(mask)
         logger.info(
             f"[perceive_object] mask 内缩: erode={mask_erode_px}px，"

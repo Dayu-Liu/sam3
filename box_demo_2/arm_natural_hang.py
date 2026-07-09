@@ -30,6 +30,8 @@ from unitree_sdk2py.utils.crc import CRC  # noqa: E402
 DT = 0.02
 DEFAULT_MOVE_DURATION = 3.0
 RELEASE_BLEND_DURATION = 2.5
+# merge_lowcmd_arm_sdk 默认 arm_stale_s=0.25；任何 handoff 空窗超过此值 RL 会抢回上半身
+ARM_SDK_BURST_FRAMES = 30
 _crc = CRC()
 
 
@@ -155,9 +157,19 @@ class ArmNaturalHangKeeper:
             if sleep_s > 0:
                 time.sleep(sleep_s)
 
+    def is_running(self) -> bool:
+        return self._running and self._thread is not None and self._thread.is_alive()
+
+    def _burst_publish(self, q_cmd: list, *, frames: int = ARM_SDK_BURST_FRAMES) -> None:
+        if self._pub is None or self.low_state is None:
+            return
+        for _ in range(frames):
+            publish_arm_sdk(self._pub, self.low_state, q_cmd, sdk_weight=1.0)
+            time.sleep(DT)
+
     def start_keepalive(self) -> None:
         self._ensure_dds()
-        if self._running:
+        if self.is_running():
             return
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True, name="arm_hang_keep")
@@ -168,9 +180,6 @@ class ArmNaturalHangKeeper:
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=1.0)
         self._thread = None
-
-    def is_running(self) -> bool:
-        return self._running
 
     def move_to_hang(self, duration: float = DEFAULT_MOVE_DURATION, start_keepalive: bool = True) -> None:
         self._ensure_dds()
@@ -194,16 +203,45 @@ class ArmNaturalHangKeeper:
         self.sync_waist_from_robot()
         self.move_to_hang(duration=duration, start_keepalive=True)
 
-    def resume_keepalive(self) -> None:
-        """已在自然下垂位姿时直接启动 50Hz 保持（无插值、不淡出）。"""
+    def ensure_keepalive(self, q_cmd: Optional[list] = None) -> None:
+        """保证 50Hz arm_sdk 不断流。merge 超过 ~250ms 未收到 arm_sdk 会回退 RL 上半身。"""
         if self.is_running():
             return
+        self.stop()
         self.sync_waist_from_robot()
         self.set_pass_waist_from_state(False)
         self._ensure_dds()
-        self.publish_once()
+        if self.low_state is None:
+            print("[arm_hang] 警告: ensure_keepalive 时 low_state 未就绪")
+            return
+        hold_q = list(q_cmd) if q_cmd is not None else self.build_q()
+        self._burst_publish(hold_q)
         self.start_keepalive()
         print("[arm_hang] 已恢复自然下垂保持（50Hz）")
+
+    def resume_keepalive(self) -> None:
+        """已在自然下垂位姿时直接启动 50Hz 保持（无插值、不淡出）。"""
+        self.ensure_keepalive()
+
+    def handoff_from_grasp(self, q_cmd: Optional[list] = None) -> None:
+        """抓取结束：与 DualArmController 重叠发布后单独接管 arm_sdk。"""
+        self.stop()
+        self.sync_waist_from_robot()
+        self.set_pass_waist_from_state(False)
+        self._ensure_dds()
+        if self.low_state is None:
+            print("[arm_hang] 警告: handoff 时 low_state 未就绪")
+            return
+        if q_cmd is None:
+            hold_q = [
+                float(self.low_state.motor_state[int(j)].q) for j in ARM_JOINTS
+            ]
+        else:
+            hold_q = list(q_cmd)
+        print("[arm_hang] 接管 arm_sdk → 自然下垂保持")
+        self._burst_publish(hold_q)
+        self.start_keepalive()
+        print("[arm_hang] 已启动自然下垂保持（50Hz，直至阶段1前交权）")
 
     def resume_after_grasp(self, duration: float = 1.0) -> None:
         if self.is_running():
@@ -290,5 +328,10 @@ def make_release_callback(keeper: ArmNaturalHangKeeper) -> Callable[[], None]:
     return keeper.stop
 
 
-def make_handoff_callback(keeper: ArmNaturalHangKeeper) -> Callable[[], None]:
-    return keeper.resume_keepalive
+def make_handoff_callback(
+    keeper: ArmNaturalHangKeeper,
+) -> Callable[[Optional[list]], None]:
+    """抓取结束：keeper 接管 arm_sdk（位姿与 controller 末帧一致，避免空窗/双写冲突）。"""
+    def _handoff(q_cmd: Optional[list] = None) -> None:
+        keeper.handoff_from_grasp(q_cmd)
+    return _handoff

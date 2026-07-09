@@ -136,6 +136,19 @@ def cam_to_torso(p_cam: list) -> np.ndarray:
     return _R_TORSO_OPT @ p + _T_TRANS
 
 
+def grasp_to_point_a_torso(grasp_left_cam, grasp_right_cam) -> tuple[np.ndarray, np.ndarray]:
+    """SAM3 抓取点 + 手长补偿 → 左右点A（torso 系）。"""
+    left_torso = cam_to_torso(grasp_left_cam)
+    right_torso = cam_to_torso(grasp_right_cam)
+    left_torso[0] -= 0.07
+    left_torso[1] += 0.09
+    left_torso[2] += 0.04
+    right_torso[0] -= 0.07
+    right_torso[1] -= 0.09
+    right_torso[2] += 0.04
+    return left_torso, right_torso
+
+
 def save_goal_to_csv(left_torso, right_torso, target_q, left_fk, right_fk, need_header: list) -> None:
     """将目标值追加写入 goal.csv（转置格式：第一列为变量名，后续列为各次数据）"""
     names = [
@@ -398,10 +411,12 @@ def main():
                         help="网络 RGBD 相机 /capture URL；留空则使用本机 USB 相机")
     parser.add_argument("--camera-serial", default=os.environ.get("HEAD_CAMERA_SERIAL", "406122070550"),
                         help="RealSense 序列号")
-    parser.add_argument("--no-vision-log", action="store_true",
-                        help="关闭每次拍照 + SAM3 结果的结构化记录")
+    parser.add_argument("--no-grip-check", action="store_true",
+                        help="关闭阶段3/4/5结束后的箱子夹持检测与自动重抓")
     parser.add_argument("--vision-log-dir", default=None,
                         help="视觉记录根目录，默认 img/runs")
+    parser.add_argument("--no-vision-log", action="store_true",
+                        help="关闭视觉记录（不保存 img/runs）")
     args = parser.parse_args()
 
     print("=" * 65)
@@ -642,6 +657,19 @@ def main():
             enabled=not args.no_vision_log,
         )
 
+        def _resolve_grip_log_dir(log: VisionSessionLog) -> str | None:
+            if args.no_grip_check:
+                return None
+            if log.root:
+                return log.root
+            stamp = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+            d = os.path.join(img_dir, "grip_logs", stamp)
+            os.makedirs(d, exist_ok=True)
+            print(f"[grip_log] 记录目录 → {d}")
+            return d
+
+        grip_log_dir = _resolve_grip_log_dir(vision_log)
+
         def _sam3_predict(stage: str, color, depth, extra=None):
             """SAM3 预测并写入 vision_log。返回 (result, meta)。"""
             result, meta = predict_from_arrays(
@@ -676,7 +704,9 @@ def main():
 
         def _restart_grasp_round(succeeded: bool) -> None:
             """一轮抓取结束（成功或 attempt 用尽）后，按 Enter 从头开始新一轮。"""
-            nonlocal vision_log
+            nonlocal vision_log, grip_log_dir
+            if arm_keeper is not None:
+                arm_keeper.ensure_keepalive()
             if succeeded:
                 print("\n抓取完成!")
             else:
@@ -688,7 +718,7 @@ def main():
             # 仅切换腿部行走模式 (RL_FULL)，便于后续对齐时底盘移动。
             # 双臂仍由 arm_keeper 经 rt/arm_sdk 保持自然下垂，不会回到 policy 初始位姿。
             if arm_keeper is not None:
-                arm_keeper.resume_keepalive()
+                arm_keeper.ensure_keepalive()
             print("[新一轮] 腿部切换为行走模式，双臂保持自然下垂...")
             try:
                 mover.initialize()
@@ -705,6 +735,7 @@ def main():
                 base_dir=args.vision_log_dir or os.path.join(img_dir, "runs"),
                 enabled=not args.no_vision_log,
             )
+            grip_log_dir = _resolve_grip_log_dir(vision_log)
 
         try:
 
@@ -795,10 +826,9 @@ def main():
 
                     # ── 坐标转换 + 手长补偿 ─────────────────────────────
                     print("\n[坐标转换] 相机系 → torso 系")
-                    left_torso  = cam_to_torso(result["grasp_left"])
-                    right_torso = cam_to_torso(result["grasp_right"])
-                    left_torso[0]  -= 0.10;  left_torso[1]  += 0.06;  left_torso[2]  += 0.10
-                    right_torso[0] -= 0.10;  right_torso[1] -= 0.06;  right_torso[2] += 0.10
+                    left_torso, right_torso = grasp_to_point_a_torso(
+                        result["grasp_left"], result["grasp_right"],
+                    )
 
                     print(f"  torso系 left  = [{left_torso[0]:.4f}, {left_torso[1]:.4f}, {left_torso[2]:.4f}]")
                     print(f"  torso系 right = [{right_torso[0]:.4f}, {right_torso[1]:.4f}, {right_torso[2]:.4f}]")
@@ -868,6 +898,9 @@ def main():
                             end_behavior=_grasp_end,
                             left_q0=left_q0,
                             right_q0=right_q0,
+                            enable_grip_check=not args.no_grip_check,
+                            grip_log_dir=grip_log_dir,
+                            grip_log_tag=f"attempt_{attempt:02d}",
                         )
                     except ValueError as e:
                         ik_elapsed = time.time() - ik_start
@@ -924,10 +957,31 @@ def main():
 
                     print("[执行] 开始双臂运动")
                     active_controller = controller
+
+                    def _regrasp_capture_point_a():
+                        """箱子脱落后：重拍并重新计算点A。"""
+                        c, d = camera.capture()
+                        res, m = predict_from_arrays(
+                            c, d, args.prompt, args.host, args.port,
+                            args.point_cloud_stage, return_meta=True,
+                        )
+                        vision_log.record(
+                            "regrasp_sam3", c, d, sam3=m,
+                            extra={"reason": "box_dropped_regrasp"},
+                        )
+                        if res is None:
+                            raise RuntimeError("SAM3 重拍失败，请检查箱子是否在视野内")
+                        lt, rt = grasp_to_point_a_torso(res["grasp_left"], res["grasp_right"])
+                        print(f"  [重抓] 新点A 左 torso={lt.round(4).tolist()}  右 torso={rt.round(4).tolist()}")
+                        return lt.tolist(), rt.tolist()
+
                     controller.run(
                         release_external_hold=_release_cb,
                         handoff_external_hold=_handoff_cb,
+                        regrasp_callback=_regrasp_capture_point_a,
                     )
+                    if arm_keeper is not None:
+                        arm_keeper.ensure_keepalive()
 
                     grasp_succeeded = True
                     break
@@ -946,6 +1000,11 @@ def main():
         except KeyboardInterrupt:
             _graceful_shutdown(controller=active_controller, interrupted=True)
             raise SystemExit(0)
+        except Exception as exc:
+            print(f"\n[错误] {type(exc).__name__}: {exc}")
+            if arm_keeper is not None and arm_keeper.is_running():
+                _graceful_shutdown(controller=active_controller)
+            raise
 
         # ── 抓取结束 ──────────────────────────────────────────
         if not shutdown_done:
